@@ -86,10 +86,20 @@ async def ensure_seed():
 async def root(): return {"message": "SELISIH siap digunakan"}
 
 @api.get("/reconciliations")
-async def list_reconciliations():
-    docs = await db.reconciliations.find({}, {"_id": 0, "po_lines": 0, "delivery_lines": 0, "invoice_lines": 0, "products": 0}).sort("created_at", -1).to_list(1000)
+async def list_reconciliations(supplier: str = "", start: str = "", end: str = ""):
+    query: Dict[str, Any] = {"deleted_at": {"$exists": False}}
+    if supplier: query["supplier_name"] = supplier
+    if start or end:
+        rng: Dict[str, str] = {}
+        if start: rng["$gte"] = start
+        if end: rng["$lte"] = end + "T23:59:59"
+        query["created_at"] = rng
+    docs = await db.reconciliations.find(query, {"_id": 0, "po_lines": 0, "delivery_lines": 0, "invoice_lines": 0, "products": 0}).sort("created_at", -1).to_list(1000)
+    all_docs = await db.reconciliations.find({"deleted_at": {"$exists": False}}, {"_id": 0, "supplier_name": 1}).to_list(2000)
+    supplier_options = sorted({d.get("supplier_name") for d in all_docs if d.get("supplier_name")})
     suppliers: Dict[str, Dict[str, Any]] = {}
     for doc in docs:
+        if doc.get("status") == "paid": continue
         name = doc.get("supplier_name") or "-"
         entry = suppliers.setdefault(name, {"supplier_name": name, "reconciliation_count": 0, "total_discrepancy": 0, "last_activity": doc.get("created_at")})
         entry["reconciliation_count"] += 1
@@ -97,19 +107,36 @@ async def list_reconciliations():
         if doc.get("created_at") and doc["created_at"] > entry["last_activity"]:
             entry["last_activity"] = doc["created_at"]
     ledger = sorted(suppliers.values(), key=lambda x: x["total_discrepancy"], reverse=True)
-    return {"items": docs, "total_found": sum(money(x.get("total_discrepancy")) for x in docs), "supplier_ledger": ledger}
+    total_open = sum(money(x.get("total_discrepancy")) for x in docs if x.get("status") != "paid")
+    return {"items": docs, "total_found": total_open, "supplier_ledger": ledger, "supplier_options": supplier_options}
 
 @api.get("/reconciliations/{rid}")
 async def get_reconciliation(rid: str):
-    doc = await db.reconciliations.find_one({"$or": [{"id": rid}, {"share_token": rid}]}, {"_id": 0})
+    doc = await db.reconciliations.find_one({"$or": [{"id": rid}, {"share_token": rid}], "deleted_at": {"$exists": False}}, {"_id": 0})
     if not doc: raise HTTPException(404, "Rekonsiliasi tidak ditemukan")
     return doc
 
 @api.delete("/reconciliations/{rid}")
 async def delete_reconciliation(rid: str):
-    result = await db.reconciliations.delete_one({"id": rid})
-    if not result.deleted_count: raise HTTPException(404, "Rekonsiliasi tidak ditemukan")
-    return {"message": "Rekonsiliasi dihapus"}
+    result = await db.reconciliations.update_one({"id": rid, "deleted_at": {"$exists": False}}, {"$set": {"deleted_at": datetime.now(timezone.utc).isoformat()}})
+    if not result.modified_count: raise HTTPException(404, "Rekonsiliasi tidak ditemukan")
+    return {"message": "Rekonsiliasi dihapus", "id": rid}
+
+@api.post("/reconciliations/{rid}/restore")
+async def restore_reconciliation(rid: str):
+    result = await db.reconciliations.update_one({"id": rid}, {"$unset": {"deleted_at": ""}})
+    if not result.modified_count: raise HTTPException(404, "Rekonsiliasi tidak dapat dipulihkan")
+    return {"message": "Rekonsiliasi dipulihkan"}
+
+class StatusUpdate(BaseModel):
+    status: str
+
+@api.patch("/reconciliations/{rid}/status")
+async def update_status(rid: str, payload: StatusUpdate):
+    if payload.status not in ("open", "paid"): raise HTTPException(400, "Status tidak valid")
+    result = await db.reconciliations.update_one({"id": rid}, {"$set": {"status": payload.status, "settled_at": datetime.now(timezone.utc).isoformat() if payload.status == "paid" else None}})
+    if not result.matched_count: raise HTTPException(404, "Rekonsiliasi tidak ditemukan")
+    return {"message": "Status diperbarui", "status": payload.status}
 
 @api.get("/reconciliations/{rid}/nota.xlsx")
 async def download_nota_xlsx(rid: str):
