@@ -94,7 +94,18 @@ async def list_reconciliations(supplier: str = "", start: str = "", end: str = "
         if start: rng["$gte"] = start
         if end: rng["$lte"] = end + "T23:59:59"
         query["created_at"] = rng
-    docs = await db.reconciliations.find(query, {"_id": 0, "po_lines": 0, "delivery_lines": 0, "invoice_lines": 0, "products": 0}).sort("created_at", -1).to_list(1000)
+    docs = await db.reconciliations.find(query, {"_id": 0, "po_lines": 0, "delivery_lines": 0, "invoice_lines": 0, "products": 0, "history": 0}).sort("created_at", -1).to_list(1000)
+    now = datetime.now(timezone.utc)
+    for doc in docs:
+        created = doc.get("created_at")
+        if created:
+            try:
+                dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                doc["days_open"] = max(0, (now - dt).days)
+            except Exception:
+                doc["days_open"] = 0
+        else:
+            doc["days_open"] = 0
     all_docs = await db.reconciliations.find({"deleted_at": {"$exists": False}}, {"_id": 0, "supplier_name": 1, "created_at": 1, "total_discrepancy": 1, "status": 1}).to_list(5000)
     supplier_options = sorted({d.get("supplier_name") for d in all_docs if d.get("supplier_name")})
     suppliers: Dict[str, Dict[str, Any]] = {}
@@ -108,11 +119,17 @@ async def list_reconciliations(supplier: str = "", start: str = "", end: str = "
             entry["last_activity"] = doc["created_at"]
     ledger = sorted(suppliers.values(), key=lambda x: x["total_discrepancy"], reverse=True)
     total_open = sum(money(x.get("total_discrepancy")) for x in docs if x.get("status") != "paid")
-    now = datetime.now(timezone.utc)
     this_month = now.strftime("%Y-%m"); last_month = (now.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
     def in_month(d, key): return (d.get("created_at") or "").startswith(key) and d.get("status") != "paid"
     monthly = {"current_month": sum(money(d.get("total_discrepancy")) for d in all_docs if in_month(d, this_month)), "previous_month": sum(money(d.get("total_discrepancy")) for d in all_docs if in_month(d, last_month)), "current_count": sum(1 for d in all_docs if in_month(d, this_month)), "previous_count": sum(1 for d in all_docs if in_month(d, last_month)), "current_label": now.strftime("%B %Y"), "previous_label": (now.replace(day=1) - timedelta(days=1)).strftime("%B %Y")}
-    return {"items": docs, "total_found": total_open, "supplier_ledger": ledger, "supplier_options": supplier_options, "monthly": monthly}
+    weeks: List[Dict[str, Any]] = []
+    today = now.date(); monday = today - timedelta(days=today.weekday())
+    for i in range(7, -1, -1):
+        start_dt = monday - timedelta(weeks=i); end_dt = start_dt + timedelta(days=7)
+        total = sum(money(d.get("total_discrepancy")) for d in all_docs if d.get("status") != "paid" and d.get("created_at") and start_dt.isoformat() <= d["created_at"][:10] < end_dt.isoformat())
+        count = sum(1 for d in all_docs if d.get("status") != "paid" and d.get("created_at") and start_dt.isoformat() <= d["created_at"][:10] < end_dt.isoformat())
+        weeks.append({"week_start": start_dt.isoformat(), "label": start_dt.strftime("%d %b"), "total": total, "count": count})
+    return {"items": docs, "total_found": total_open, "supplier_ledger": ledger, "supplier_options": supplier_options, "monthly": monthly, "weekly_trend": weeks}
 
 @api.get("/reconciliations/{rid}")
 async def get_reconciliation(rid: str):
@@ -134,34 +151,45 @@ async def restore_reconciliation(rid: str):
 
 class StatusUpdate(BaseModel):
     status: str
+    actor: str = ""
 
 class NotesUpdate(BaseModel):
     notes: str
+    actor: str = ""
 
 class BulkAction(BaseModel):
     ids: List[str]
     action: str
+    actor: str = ""
+
+def record_history(action: str, actor: str, detail: str = "") -> Dict[str, Any]:
+    return {"action": action, "actor": actor or "Pengguna", "detail": detail, "timestamp": datetime.now(timezone.utc).isoformat()}
 
 @api.patch("/reconciliations/{rid}/status")
 async def update_status(rid: str, payload: StatusUpdate):
     if payload.status not in ("open", "paid"): raise HTTPException(400, "Status tidak valid")
-    result = await db.reconciliations.update_one({"id": rid}, {"$set": {"status": payload.status, "settled_at": datetime.now(timezone.utc).isoformat() if payload.status == "paid" else None}})
+    entry = record_history("status", payload.actor, f"Status diubah menjadi {payload.status}")
+    result = await db.reconciliations.update_one({"id": rid}, {"$set": {"status": payload.status, "settled_at": datetime.now(timezone.utc).isoformat() if payload.status == "paid" else None}, "$push": {"history": entry}})
     if not result.matched_count: raise HTTPException(404, "Rekonsiliasi tidak ditemukan")
     return {"message": "Status diperbarui", "status": payload.status}
 
 @api.patch("/reconciliations/{rid}/notes")
 async def update_notes(rid: str, payload: NotesUpdate):
-    result = await db.reconciliations.update_one({"id": rid, "deleted_at": {"$exists": False}}, {"$set": {"notes": payload.notes[:2000]}})
+    entry = record_history("notes", payload.actor, "Catatan diperbarui")
+    result = await db.reconciliations.update_one({"id": rid, "deleted_at": {"$exists": False}}, {"$set": {"notes": payload.notes[:2000]}, "$push": {"history": entry}})
     if not result.matched_count: raise HTTPException(404, "Rekonsiliasi tidak ditemukan")
     return {"message": "Catatan disimpan"}
 
 @api.post("/reconciliations/bulk")
 async def bulk_action(payload: BulkAction):
     if not payload.ids: raise HTTPException(400, "Tidak ada rekonsiliasi terpilih")
+    now_iso = datetime.now(timezone.utc).isoformat()
     if payload.action == "delete":
-        result = await db.reconciliations.update_many({"id": {"$in": payload.ids}, "deleted_at": {"$exists": False}}, {"$set": {"deleted_at": datetime.now(timezone.utc).isoformat()}})
+        entry = record_history("delete", payload.actor, "Dihapus (bulk)")
+        result = await db.reconciliations.update_many({"id": {"$in": payload.ids}, "deleted_at": {"$exists": False}}, {"$set": {"deleted_at": now_iso}, "$push": {"history": entry}})
     elif payload.action in ("paid", "open"):
-        result = await db.reconciliations.update_many({"id": {"$in": payload.ids}}, {"$set": {"status": payload.action, "settled_at": datetime.now(timezone.utc).isoformat() if payload.action == "paid" else None}})
+        entry = record_history("status", payload.actor, f"Status diubah menjadi {payload.action} (bulk)")
+        result = await db.reconciliations.update_many({"id": {"$in": payload.ids}}, {"$set": {"status": payload.action, "settled_at": now_iso if payload.action == "paid" else None}, "$push": {"history": entry}})
     else:
         raise HTTPException(400, "Aksi tidak valid")
     return {"message": "Berhasil", "affected": result.modified_count}
