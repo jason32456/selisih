@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 import os
@@ -95,7 +95,7 @@ async def list_reconciliations(supplier: str = "", start: str = "", end: str = "
         if end: rng["$lte"] = end + "T23:59:59"
         query["created_at"] = rng
     docs = await db.reconciliations.find(query, {"_id": 0, "po_lines": 0, "delivery_lines": 0, "invoice_lines": 0, "products": 0}).sort("created_at", -1).to_list(1000)
-    all_docs = await db.reconciliations.find({"deleted_at": {"$exists": False}}, {"_id": 0, "supplier_name": 1}).to_list(2000)
+    all_docs = await db.reconciliations.find({"deleted_at": {"$exists": False}}, {"_id": 0, "supplier_name": 1, "created_at": 1, "total_discrepancy": 1, "status": 1}).to_list(5000)
     supplier_options = sorted({d.get("supplier_name") for d in all_docs if d.get("supplier_name")})
     suppliers: Dict[str, Dict[str, Any]] = {}
     for doc in docs:
@@ -108,7 +108,11 @@ async def list_reconciliations(supplier: str = "", start: str = "", end: str = "
             entry["last_activity"] = doc["created_at"]
     ledger = sorted(suppliers.values(), key=lambda x: x["total_discrepancy"], reverse=True)
     total_open = sum(money(x.get("total_discrepancy")) for x in docs if x.get("status") != "paid")
-    return {"items": docs, "total_found": total_open, "supplier_ledger": ledger, "supplier_options": supplier_options}
+    now = datetime.now(timezone.utc)
+    this_month = now.strftime("%Y-%m"); last_month = (now.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+    def in_month(d, key): return (d.get("created_at") or "").startswith(key) and d.get("status") != "paid"
+    monthly = {"current_month": sum(money(d.get("total_discrepancy")) for d in all_docs if in_month(d, this_month)), "previous_month": sum(money(d.get("total_discrepancy")) for d in all_docs if in_month(d, last_month)), "current_count": sum(1 for d in all_docs if in_month(d, this_month)), "previous_count": sum(1 for d in all_docs if in_month(d, last_month)), "current_label": now.strftime("%B %Y"), "previous_label": (now.replace(day=1) - timedelta(days=1)).strftime("%B %Y")}
+    return {"items": docs, "total_found": total_open, "supplier_ledger": ledger, "supplier_options": supplier_options, "monthly": monthly}
 
 @api.get("/reconciliations/{rid}")
 async def get_reconciliation(rid: str):
@@ -131,12 +135,80 @@ async def restore_reconciliation(rid: str):
 class StatusUpdate(BaseModel):
     status: str
 
+class NotesUpdate(BaseModel):
+    notes: str
+
+class BulkAction(BaseModel):
+    ids: List[str]
+    action: str
+
 @api.patch("/reconciliations/{rid}/status")
 async def update_status(rid: str, payload: StatusUpdate):
     if payload.status not in ("open", "paid"): raise HTTPException(400, "Status tidak valid")
     result = await db.reconciliations.update_one({"id": rid}, {"$set": {"status": payload.status, "settled_at": datetime.now(timezone.utc).isoformat() if payload.status == "paid" else None}})
     if not result.matched_count: raise HTTPException(404, "Rekonsiliasi tidak ditemukan")
     return {"message": "Status diperbarui", "status": payload.status}
+
+@api.patch("/reconciliations/{rid}/notes")
+async def update_notes(rid: str, payload: NotesUpdate):
+    result = await db.reconciliations.update_one({"id": rid, "deleted_at": {"$exists": False}}, {"$set": {"notes": payload.notes[:2000]}})
+    if not result.matched_count: raise HTTPException(404, "Rekonsiliasi tidak ditemukan")
+    return {"message": "Catatan disimpan"}
+
+@api.post("/reconciliations/bulk")
+async def bulk_action(payload: BulkAction):
+    if not payload.ids: raise HTTPException(400, "Tidak ada rekonsiliasi terpilih")
+    if payload.action == "delete":
+        result = await db.reconciliations.update_many({"id": {"$in": payload.ids}, "deleted_at": {"$exists": False}}, {"$set": {"deleted_at": datetime.now(timezone.utc).isoformat()}})
+    elif payload.action in ("paid", "open"):
+        result = await db.reconciliations.update_many({"id": {"$in": payload.ids}}, {"$set": {"status": payload.action, "settled_at": datetime.now(timezone.utc).isoformat() if payload.action == "paid" else None}})
+    else:
+        raise HTTPException(400, "Aksi tidak valid")
+    return {"message": "Berhasil", "affected": result.modified_count}
+
+@api.get("/summary.xlsx")
+async def download_summary_xlsx(supplier: str = "", start: str = "", end: str = ""):
+    query: Dict[str, Any] = {"deleted_at": {"$exists": False}}
+    if supplier: query["supplier_name"] = supplier
+    if start or end:
+        rng: Dict[str, str] = {}
+        if start: rng["$gte"] = start
+        if end: rng["$lte"] = end + "T23:59:59"
+        query["created_at"] = rng
+    docs = await db.reconciliations.find(query, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    wb = Workbook(); ws = wb.active; ws.title = "Ringkasan"
+    header_font = Font(name="Calibri", bold=True, color="FFFFFF"); header_fill = PatternFill("solid", fgColor="14161C")
+    ws["A1"] = "RINGKASAN REKONSILIASI"; ws["A1"].font = Font(bold=True, size=16)
+    filters = []
+    if supplier: filters.append(f"Pemasok: {supplier}")
+    if start: filters.append(f"Dari: {start}")
+    if end: filters.append(f"Sampai: {end}")
+    ws["A2"] = " · ".join(filters) if filters else "Semua rekonsiliasi"
+    ws["A3"] = f"Dibuat: {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+    headers = ["Referensi", "Pemasok", "Tanggal", "Status", "Total selisih (Rp)", "Catatan"]
+    for col, value in enumerate(headers, 1):
+        cell = ws.cell(row=5, column=col, value=value); cell.font = header_font; cell.fill = header_fill; cell.alignment = Alignment(horizontal="left")
+    row = 6; open_total = 0; paid_total = 0
+    for doc in docs:
+        status = doc.get("status", "open"); disc = money(doc.get("total_discrepancy"))
+        ws.cell(row=row, column=1, value=doc.get("reference", ""))
+        ws.cell(row=row, column=2, value=doc.get("supplier_name", ""))
+        ws.cell(row=row, column=3, value=(doc.get("created_at") or "")[:10])
+        ws.cell(row=row, column=4, value="Sudah dibayar" if status == "paid" else "Terbuka")
+        ws.cell(row=row, column=5, value=disc).number_format = "#,##0"
+        ws.cell(row=row, column=6, value=doc.get("notes", ""))
+        if status == "paid": paid_total += disc
+        else: open_total += disc
+        row += 1
+    ws.cell(row=row + 1, column=4, value="Total terbuka").font = Font(bold=True)
+    ws.cell(row=row + 1, column=5, value=open_total).number_format = "#,##0"
+    ws.cell(row=row + 2, column=4, value="Total sudah dibayar").font = Font(bold=True)
+    ws.cell(row=row + 2, column=5, value=paid_total).number_format = "#,##0"
+    for col, width in enumerate([16, 30, 14, 18, 20, 45], 1):
+        ws.column_dimensions[chr(64 + col)].width = width
+    buffer = BytesIO(); wb.save(buffer); buffer.seek(0)
+    filename = f"ringkasan-rekonsiliasi-{datetime.now().strftime('%Y%m%d')}.xlsx"
+    return StreamingResponse(buffer, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 @api.get("/reconciliations/{rid}/nota.xlsx")
 async def download_nota_xlsx(rid: str):
