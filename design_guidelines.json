@@ -1,0 +1,60 @@
+{
+  "app_name": "SELISIH",
+  "distributor_name": "Distributor Anda",
+  "app_type": "hybrid_fullstack",
+  "domain": "Indonesian FMCG Delivery Reconciliation & Invoice Discrepancy Auditor",
+  "visual_style": {
+    "theme": "carbon-copy Indonesian warehouse triplicate pad",
+    "background": "#F2F2ED",
+    "text_primary": "#14161C",
+    "text_secondary": "#6B6B63",
+    "borders": "#C9C7BE",
+    "document_colors": {
+      "po": "#FFFFFF",
+      "surat_jalan": "#F6E7A9",
+      "faktur": "#F5CBD1"
+    },
+    "status_colors": {
+      "matched": "#2F6B4F",
+      "discrepancy": "#C0272D"
+    },
+    "border_radius": "max 2px radius (sharp paper-like edges)",
+    "gradients": "none",
+    "shadows": "crisp hairline borders, paper not glass"
+  },
+  "typography": {
+    "headings": "Archivo bold",
+    "body": "Instrument Sans",
+    "numbers_skus_codes": "IBM Plex Mono",
+    "weights": ["light", "regular", "bold", "black"]
+  },
+  "comparison_rules": [
+    "KURANG KIRIM",
+    "BARANG RUSAK",
+    "TAGIH LEBIH",
+    "HARGA TIDAK SESUAI",
+    "TIDAK ADA DI PO",
+    "KIRIM LEBIH",
+    "BELUM DITAGIH",
+    "COCOK"
+  ],
+  "key_functionalities": [
+    "Dashboard reconciliation list with total discrepancy in Rupiah (integer only)",
+    "New reconciliation entry wizard matching PO, Surat Jalan, and Faktur with typing and Excel paste preview",
+    "Automated comparison engine across 3 documents (PO vs Surat Jalan vs Faktur)",
+    "Discrepancy classification into 8 strict Indonesian rules",
+    "Nota Retur / Berita Acara Selisih printable via browser print-to-PDF with terbilang (Indonesian number spelling) and signature blocks",
+    "Tokenized read-only supplier sharing with WhatsApp direct message link",
+    "Seeded Indonesian FMCG reconciliations with realistic SKU codes and supplier names (e.g. PT Indofood Sukses Makmur, PT Unilever Indonesia Tbk, PT Mayora Indah Tbk)",
+    "Mobile responsive expandable comparison blocks",
+    "Visible keyboard focus and data-testid attributes on all interactive elements"
+  ],
+  "image_urls": [
+    {
+      "category": "receipt_placeholder",
+      "url": "https://images.unsplash.com/photo-1673874855449-e8620ddfa867?crop=entropy&cs=srgb&fm=jpg&q=85",
+      "description": "Warehouse document paper pile background texture"
+    }
+  ],
+  "instructions_to_main_agent": "Build a React + FastAPI application with exact carbon-copy Indonesian warehouse aesthetics (#F2F2ED background, #F6E7A9 Surat Jalan, #F5CBD1 Faktur, #C0272D discrepancy red, integer rupiah formatting, Bahasa Indonesia UI). Ensure all components have data-testid attributes and support Nota Retur printing with terbilang and WhatsApp supplier share tokens."
+}
