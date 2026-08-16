@@ -7,13 +7,15 @@ import uuid
 from io import BytesIO
 
 from dotenv import load_dotenv
-from fastapi import APIRouter, FastAPI, HTTPException
+from fastapi import APIRouter, FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from pydantic import BaseModel, Field
+import pdfplumber
+import re
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -35,7 +37,86 @@ class ReconciliationCreate(BaseModel):
 def money(value: Any) -> int:
     return int(value or 0)
 
-def compare_documents(data: ReconciliationCreate) -> Dict[str, Any]:
+def parse_price(text: str) -> int:
+    if not text: return 0
+    cleaned = re.sub(r"[Rr][Pp]\.?", "", str(text)).replace(" ", "").strip()
+    if "," in cleaned and "." in cleaned:
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    elif "," in cleaned:
+        parts = cleaned.split(",")
+        cleaned = "".join(parts[:-1]) + "." + parts[-1] if len(parts[-1]) <= 2 else cleaned.replace(",", "")
+    else:
+        cleaned = cleaned.replace(".", "")
+    try: return int(round(float(cleaned)))
+    except Exception: return 0
+
+def parse_pdf_rows(pdf_bytes: bytes, doc_type: str) -> Dict[str, Any]:
+    rows: List[Dict[str, Any]] = []; failures: List[str] = []
+    price_re = re.compile(r"^(?:Rp\.?\s?)?[\d.,]+$", re.IGNORECASE)
+    sku_re = re.compile(r"^[A-Z0-9][A-Z0-9\-_/]{2,}$", re.IGNORECASE)
+    try:
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            tables: List[List[List[str]]] = []
+            for page in pdf.pages:
+                for tab in page.extract_tables() or []:
+                    if tab: tables.append(tab)
+            text_lines: List[str] = []
+            if not tables:
+                for page in pdf.pages:
+                    text_lines.extend((page.extract_text() or "").split("\n"))
+            for table in tables:
+                header_seen = False
+                for raw in table:
+                    cells = [str(c or "").strip() for c in raw]
+                    if not any(cells): continue
+                    joined = " ".join(cells).lower()
+                    if not header_seen and any(k in joined for k in ("sku", "kode", "nama barang", "produk")):
+                        header_seen = True; continue
+                    numbers = [parse_price(c) for c in cells if price_re.match(c)]
+                    if not cells[0] or len(numbers) < 1:
+                        if cells[0]: failures.append(f"Baris tidak terbaca: {' | '.join(cells)}")
+                        continue
+                    sku = cells[0]; name = cells[1] if len(cells) > 1 else ""
+                    unit = cells[2] if len(cells) > 2 and not price_re.match(cells[2]) else "karton"
+                    if doc_type == "delivery":
+                        rows.append({"sku": sku, "name": name, "unit": unit, "quantity": numbers[0], "damaged": numbers[1] if len(numbers) > 1 else 0})
+                    else:
+                        rows.append({"sku": sku, "name": name, "unit": unit, "quantity": numbers[0], "unit_price": numbers[-1] if len(numbers) > 1 else 0})
+            for line in text_lines:
+                line = line.strip()
+                if not line: continue
+                lower = line.lower()
+                if any(k in lower for k in ("purchase order", "surat jalan", "faktur", "no.", "tanggal", "kepada", "dari", "total ", "sub total")):
+                    continue
+                if any(k in lower for k in ("sku ", "kode ", "nama barang", "harga sat", "jumlah diterima")):
+                    continue
+                tokens = line.split()
+                if len(tokens) < 3 or not sku_re.match(tokens[0]): continue
+                sku = tokens[0]
+                numeric_positions = [i for i, t in enumerate(tokens) if price_re.match(t) and i > 0]
+                if not numeric_positions:
+                    failures.append(f"Tidak menemukan angka: {line}"); continue
+                nums = [parse_price(tokens[i]) for i in numeric_positions]
+                first_num_pos = numeric_positions[0]
+                middle = [t for t in tokens[1:first_num_pos] if t.lower() != "rp"]
+                unit = "karton"
+                if middle and middle[-1].lower() in ("karton", "dus", "pcs", "pack", "botol", "sak"):
+                    unit = middle[-1].lower(); middle = middle[:-1]
+                name = " ".join(middle).strip() or sku
+                if doc_type == "delivery":
+                    rows.append({"sku": sku, "name": name, "unit": unit, "quantity": nums[0], "damaged": nums[1] if len(nums) > 1 else 0})
+                else:
+                    rows.append({"sku": sku, "name": name, "unit": unit, "quantity": nums[0], "unit_price": nums[-1] if len(nums) > 1 else 0})
+    except HTTPException:
+        raise
+    except Exception as ex:
+        raise HTTPException(400, f"Gagal membaca PDF: {ex}")
+    return {"rows": rows, "failures": failures}
+
+def compare_documents(data: "ReconciliationCreate") -> Dict[str, Any]:
     po = {str(x.get("sku", "")).strip(): x for x in data.po_lines if str(x.get("sku", "")).strip()}
     received: Dict[str, Dict[str, Any]] = {}
     for line in data.delivery_lines:
@@ -86,7 +167,7 @@ async def ensure_seed():
 async def root(): return {"message": "SELISIH siap digunakan"}
 
 @api.get("/reconciliations")
-async def list_reconciliations(supplier: str = "", start: str = "", end: str = ""):
+async def list_reconciliations(supplier: str = "", start: str = "", end: str = "", status: str = ""):
     query: Dict[str, Any] = {"deleted_at": {"$exists": False}}
     if supplier: query["supplier_name"] = supplier
     if start or end:
@@ -94,6 +175,8 @@ async def list_reconciliations(supplier: str = "", start: str = "", end: str = "
         if start: rng["$gte"] = start
         if end: rng["$lte"] = end + "T23:59:59"
         query["created_at"] = rng
+    if status == "paid": query["status"] = "paid"
+    elif status == "open": query["$or"] = [{"status": "open"}, {"status": {"$exists": False}}]
     docs = await db.reconciliations.find(query, {"_id": 0, "po_lines": 0, "delivery_lines": 0, "invoice_lines": 0, "products": 0, "history": 0}).sort("created_at", -1).to_list(1000)
     now = datetime.now(timezone.utc)
     for doc in docs:
@@ -193,6 +276,15 @@ async def bulk_action(payload: BulkAction):
     else:
         raise HTTPException(400, "Aksi tidak valid")
     return {"message": "Berhasil", "affected": result.modified_count}
+
+@api.post("/parse-pdf")
+async def parse_pdf(doc_type: str, file: UploadFile = File(...)):
+    if doc_type not in ("po", "delivery", "faktur"): raise HTTPException(400, "Jenis dokumen tidak valid")
+    if not file.filename or not file.filename.lower().endswith(".pdf"): raise HTTPException(400, "Unggah berkas PDF")
+    data = await file.read()
+    if len(data) > 5 * 1024 * 1024: raise HTTPException(400, "Ukuran PDF terlalu besar (maksimal 5 MB)")
+    result = parse_pdf_rows(data, doc_type)
+    return result
 
 @api.get("/summary.xlsx")
 async def download_summary_xlsx(supplier: str = "", start: str = "", end: str = ""):
