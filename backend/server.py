@@ -4,10 +4,15 @@ from typing import Any, Dict, List
 import os
 import uuid
 
+from io import BytesIO
+
 from dotenv import load_dotenv
 from fastapi import APIRouter, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from motor.motor_asyncio import AsyncIOMotorClient
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 from pydantic import BaseModel, Field
 
 ROOT_DIR = Path(__file__).parent
@@ -83,7 +88,16 @@ async def root(): return {"message": "SELISIH siap digunakan"}
 @api.get("/reconciliations")
 async def list_reconciliations():
     docs = await db.reconciliations.find({}, {"_id": 0, "po_lines": 0, "delivery_lines": 0, "invoice_lines": 0, "products": 0}).sort("created_at", -1).to_list(1000)
-    return {"items": docs, "total_found": sum(money(x.get("total_discrepancy")) for x in docs)}
+    suppliers: Dict[str, Dict[str, Any]] = {}
+    for doc in docs:
+        name = doc.get("supplier_name") or "-"
+        entry = suppliers.setdefault(name, {"supplier_name": name, "reconciliation_count": 0, "total_discrepancy": 0, "last_activity": doc.get("created_at")})
+        entry["reconciliation_count"] += 1
+        entry["total_discrepancy"] += money(doc.get("total_discrepancy"))
+        if doc.get("created_at") and doc["created_at"] > entry["last_activity"]:
+            entry["last_activity"] = doc["created_at"]
+    ledger = sorted(suppliers.values(), key=lambda x: x["total_discrepancy"], reverse=True)
+    return {"items": docs, "total_found": sum(money(x.get("total_discrepancy")) for x in docs), "supplier_ledger": ledger}
 
 @api.get("/reconciliations/{rid}")
 async def get_reconciliation(rid: str):
@@ -96,6 +110,39 @@ async def delete_reconciliation(rid: str):
     result = await db.reconciliations.delete_one({"id": rid})
     if not result.deleted_count: raise HTTPException(404, "Rekonsiliasi tidak ditemukan")
     return {"message": "Rekonsiliasi dihapus"}
+
+@api.get("/reconciliations/{rid}/nota.xlsx")
+async def download_nota_xlsx(rid: str):
+    doc = await db.reconciliations.find_one({"id": rid}, {"_id": 0})
+    if not doc: raise HTTPException(404, "Rekonsiliasi tidak ditemukan")
+    wb = Workbook(); ws = wb.active; ws.title = "Nota Retur"
+    header_font = Font(name="Calibri", bold=True, color="FFFFFF")
+    header_fill = PatternFill("solid", fgColor="14161C")
+    ws["A1"] = "NOTA RETUR"; ws["A1"].font = Font(name="Calibri", bold=True, size=16)
+    ws["A2"] = f"Nomor nota: NR-{doc.get('reference', '')}"
+    ws["A3"] = f"Pemasok: {doc.get('supplier_name', '')}"
+    ws["A4"] = f"Referensi: {doc.get('reference', '')}"
+    ws["A5"] = f"Tanggal: {datetime.now().strftime('%d/%m/%Y')}"
+    headers = ["SKU", "Produk", "Jenis selisih", "Nilai (Rp)"]
+    for col, value in enumerate(headers, 1):
+        cell = ws.cell(row=7, column=col, value=value); cell.font = header_font; cell.fill = header_fill; cell.alignment = Alignment(horizontal="left")
+    row = 8
+    for product in doc.get("products", []):
+        for issue in product.get("issues", []):
+            if not money(issue.get("value")): continue
+            ws.cell(row=row, column=1, value=product.get("sku", ""))
+            ws.cell(row=row, column=2, value=product.get("name", ""))
+            ws.cell(row=row, column=3, value=issue.get("type", ""))
+            ws.cell(row=row, column=4, value=money(issue.get("value"))).number_format = "#,##0"
+            row += 1
+    ws.cell(row=row + 1, column=3, value="Total klaim").font = Font(bold=True)
+    total_cell = ws.cell(row=row + 1, column=4, value=money(doc.get("total_discrepancy")))
+    total_cell.number_format = "#,##0"; total_cell.font = Font(bold=True)
+    for col, width in enumerate([16, 32, 22, 18], 1):
+        ws.column_dimensions[chr(64 + col)].width = width
+    buffer = BytesIO(); wb.save(buffer); buffer.seek(0)
+    filename = f"nota-retur-{doc.get('reference', rid)}.xlsx"
+    return StreamingResponse(buffer, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 @api.post("/reconciliations")
 async def create_reconciliation(data: ReconciliationCreate):
